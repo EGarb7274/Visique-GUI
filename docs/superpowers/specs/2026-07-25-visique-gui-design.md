@@ -24,11 +24,31 @@ Visique-GUI reaches feature parity.
 
 - The FastAPI backend's own `/api/v1/analysis/upload/xlsx` endpoint is
   **deprecated** (returns HTTP 410). The real parsing/analysis path is a
-  Vercel serverless function, `frontend/api/analyze_xlsx.py`, which has a
+  Vercel serverless function, `frontend/api/analyze_xlsx.py`, exposed at
+  `/api/analyze/xlsx` (see `frontend/vercel.json` rewrites), which has a
   hard **4MB payload ceiling** (`MAX_PAYLOAD_SIZE`).
-- Persistence and retrieval happen on the FastAPI backend, separately:
-  `POST /api/v1/analysis/save` and `GET /api/v1/analysis/history` /
-  `GET /api/v1/analysis/history/{id}`.
+- Retrieval happens on the FastAPI backend: `GET /api/v1/analysis/history`
+  and `GET /api/v1/analysis/history/{id}`.
+- **Persistence does NOT happen by calling the FastAPI backend's `/save`
+  directly.** The raw endpoint (`POST /api/v1/analysis/save`) requires an
+  HMAC `X-Service-Signature` header whenever `SERVICE_SECRET_KEY` is set on
+  the backend — and it is, in production (`backend/render.yaml` auto-generates
+  it). That secret must never be embedded in client software. The real save
+  path is a Vercel proxy, `frontend/api/save_analysis.py`, exposed at
+  `/api/save` (see `frontend/vercel.json` rewrites): it holds
+  `SERVICE_SECRET_KEY` server-side, signs the payload, and forwards it to
+  the Render backend with both the JWT and the signature attached. Clients
+  (including Visique-GUI) must call `/api/save`, never the raw backend
+  endpoint.
+- Both Vercel functions (`analyze_xlsx.py`, `save_analysis.py`) hand-roll
+  their own CORS with a hardcoded origin allowlist (`visique.xyz`,
+  `visique-testing.vercel.app`, `localhost:3000`) that does **not** include
+  Electron's `file://` origin (packaged app) or a dev server port like
+  Vite's `localhost:5173`. A renderer calling `fetch()` directly against
+  either endpoint would be blocked by CORS in both dev and packaged builds.
+  (The main FastAPI backend's own CORS config is more permissive — it
+  allows `file://.*` via regex — but that doesn't help here since these two
+  calls target the Vercel functions, not the backend directly.)
 - Backend and Vercel each maintain their own copy of the CSV/XLSX parsers
   today (`docs/current_issues.md`, Issue 4) — a known drift risk. Visique-GUI
   should not add a third copy by parsing locally.
@@ -39,30 +59,48 @@ Visique-GUI reaches feature parity.
 
 Three Electron layers:
 
-- **Main process** — window lifecycle, native file-open dialog, and a
+- **Main process** — window lifecycle, native file-open dialog, a
   `safeStorage`-backed IPC bridge for token persistence (OS keychain, not
-  `localStorage`). `contextIsolation: true`, `nodeIntegration: false`,
+  `localStorage`), and executes the actual HTTP requests to Vercel/FastAPI
+  (see correction below — this sidesteps a real CORS restriction on the
+  Vercel endpoints). `contextIsolation: true`, `nodeIntegration: false`,
   matching the existing scaffold's `webPreferences` hardening.
-- **Preload** — narrow `contextBridge` exposing only `openFileDialog()` and
-  `getToken()` / `setToken()` / `clearToken()`.
+- **Preload** — narrow `contextBridge` exposing `openFileDialog()`,
+  `getToken()` / `setToken()` / `clearToken()`, and `apiRequest(method, url,
+  body, token)`.
 - **Renderer** — React + TypeScript, built with Vite. Charts via `recharts`
   (already used by the Next.js frontend — no new charting-library risk).
 
-All backend interaction goes through one module,
+All backend interaction goes through one renderer-facing module,
 `src/renderer/api/visiqueClient.ts`, exposing exactly:
 
-- `analyzeFile(file)` — POSTs to the Vercel analyze endpoint, returns an
-  unsaved `StandardizedDataPackage`.
-- `saveAnalysis(pkg)` — POSTs to FastAPI `/api/v1/analysis/save`, returns
-  `{ id }`.
+- `analyzeFile(file)` — sends the file to `/api/analyze/xlsx` (Vercel),
+  returns an unsaved `StandardizedDataPackage`.
+- `saveAnalysis(pkg)` — sends the package to `/api/save` (Vercel proxy —
+  **not** the raw FastAPI `/api/v1/analysis/save`, which requires an
+  HMAC signature this client must never hold), returns `{ id }`.
 - `getHistory()` — GET FastAPI `/api/v1/analysis/history`.
 - `getAnalysis(id)` — GET FastAPI `/api/v1/analysis/history/{id}`.
+
+**Correction after investigation:** these four functions do not call
+`fetch()` themselves. Both Vercel endpoints (`/api/analyze/xlsx`,
+`/api/save`) enforce a hardcoded CORS origin allowlist that excludes
+Electron's `file://` origin and dev-server ports — a renderer-side `fetch()`
+would be blocked in both dev and packaged builds. Instead, each function in
+`visiqueClient.ts` calls a single generic IPC channel
+(`window.visique.apiRequest(method, url, body, token)`) exposed by the
+preload script. The main process executes the actual HTTP request in its
+Node context, which isn't subject to browser CORS at all. This keeps the
+renderer-facing API surface identical to a direct-fetch design (one module,
+four functions) while avoiding the CORS gap entirely — a lighter version of
+"Approach B" applied only to the mechanics of sending a request, not to
+per-feature business logic.
 
 Base URLs are configurable via env vars with production defaults, mirroring
 the scaffold's `VISIQUE_APP_URL` pattern. This module is the intentional
 seam: if backend parsing is ever consolidated off Vercel onto FastAPI (the
 recommended long-term direction — see "Analysis Path" decision below), only
-`analyzeFile()`'s implementation changes; no UI code does.
+`analyzeFile()`'s target URL changes; no UI code does.
 
 **Auth is mocked for v1**: a fixed fake user/token in an `AuthContext`,
 built behind the same client-module boundary so the real login flow
@@ -88,15 +126,20 @@ parsing/analysis:
 
 Three structures were considered:
 
-- **(A, chosen)** React+TS renderer makes API calls directly via `fetch`;
-  JWT persistence goes through a narrow IPC bridge to `safeStorage` instead
-  of `localStorage`.
-- (B) All network calls routed through the main process via IPC, so the
-  JWT never enters the renderer's JS context at all. Stronger isolation,
-  but every new API call requires wiring three places (main handler, preload
-  bridge, renderer caller) instead of one `fetch` call. Worth revisiting if
-  the renderer ever needs to run untrusted/third-party code; not a v1
-  concern.
+- **(A, chosen, refined)** React+TS renderer's `visiqueClient.ts` calls a
+  single generic IPC channel (`apiRequest`) rather than `fetch()` directly;
+  the main process executes the HTTP request. This was refined after
+  investigation showed the Vercel endpoints' hardcoded CORS allowlist would
+  block a renderer-side `fetch()` outright (see "Context / Constraints
+  Discovered"). JWT persistence goes through the same IPC bridge to
+  `safeStorage` instead of `localStorage`.
+- (B) All network calls routed through the main process via per-feature IPC
+  handlers (a distinct main handler + preload method for each of
+  analyze/save/history), so no business logic lives in the renderer at all.
+  Rejected as unnecessary: the single generic `apiRequest` channel already
+  gets the CORS and token-isolation benefits without per-feature plumbing.
+  Worth revisiting only if the renderer ever needs to run untrusted/third-
+  party code.
 - (C) Vanilla TS renderer, no framework. Rejected: a dashboard + history
   list + growing feature set benefits from componentization; hand-rolling
   it manually doesn't pay off since bundle size isn't a real constraint for
@@ -125,12 +168,13 @@ Three structures were considered:
 
 1. App launches → mock-authenticated immediately → lands on `UploadScreen`.
 2. User picks/drops an `.xlsx` → client-side validation → `analyzeFile()`
-   POSTs to the Vercel function → returns an unsaved
-   `StandardizedDataPackage`.
-3. App immediately calls `saveAnalysis(pkg)` → FastAPI `/save` → returns
-   `{ id }`.
-4. App navigates to `DashboardScreen`, calls `getAnalysis(id)` → FastAPI
-   `/history/{id}` → renders.
+   → IPC `apiRequest` → main process POSTs to Vercel's `/api/analyze/xlsx`
+   → returns an unsaved `StandardizedDataPackage`.
+3. App immediately calls `saveAnalysis(pkg)` → IPC `apiRequest` → main
+   process POSTs to Vercel's `/api/save` (proxy, HMAC-signed server-side,
+   never the raw FastAPI endpoint) → returns `{ id }`.
+4. App navigates to `DashboardScreen`, calls `getAnalysis(id)` → IPC
+   `apiRequest` → main process GETs FastAPI `/history/{id}` → renders.
 5. `HistoryScreen` calls `getHistory()` on demand; selecting a past entry
    re-fetches via `getAnalysis(id)` and reuses `DashboardScreen`.
 
@@ -148,10 +192,15 @@ Three structures were considered:
 
 ## Testing
 
-- Unit tests for `visiqueClient.ts` against mocked `fetch`.
+- Unit tests for `visiqueClient.ts` against a mocked
+  `window.visique.apiRequest` (not `fetch` — see the IPC correction above).
+- Unit tests for the main process's IPC handler that executes `apiRequest`,
+  against a mocked Node `fetch`.
 - Component tests for `DashboardScreen` using a fixture
-  `StandardizedDataPackage` (reuse an existing golden fixture from
-  `backend/tests/data/` if the shape lines up).
+  `StandardizedDataPackage`. `backend/tests/data/` only contains PDF
+  fixtures (`apple_2024_10k.pdf`, `sampledata.pdf`) — no ready-made JSON
+  fixture matching this shape exists, so v1 creates its own synthetic
+  fixture conforming to the `StandardizedDataPackage`/`types.ts` shape.
 - Manual smoke test before calling v1 done: launch the app, upload a real
   sample `.xlsx`, confirm the dashboard renders end-to-end against the live
   Vercel/FastAPI services.
